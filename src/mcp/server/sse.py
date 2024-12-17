@@ -36,9 +36,10 @@ See SseServerTransport class documentation for more details.
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import quote
 from uuid import UUID, uuid4
+from dataclasses import dataclass
 
 import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
@@ -47,10 +48,56 @@ from sse_starlette import EventSourceResponse
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
+from redis.asyncio import Redis
+import pickle
+import time
 
 import mcp.types as types
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SerializableStreamWriter:
+    """可序列化的流写入器包装类"""
+    session_id: UUID
+    created_at: float
+    last_active: float
+    
+    @staticmethod
+    def from_stream(session_id: UUID, writer: MemoryObjectSendStream) -> 'SerializableStreamWriter':
+        """
+        从流创建可序列化的包装对象
+        
+        Args:
+            session_id: 会话ID
+            writer: 原始的流写入器
+            
+        Returns:
+            SerializableStreamWriter: 可序列化的包装对象
+        """
+        now = time.time()
+        return SerializableStreamWriter(
+            session_id=session_id,
+            created_at=now,
+            last_active=now
+        )
+    
+    def is_expired(self, ttl: int) -> bool:
+        """
+        检查会话是否过期
+        
+        Args:
+            ttl: 过期时间（秒）
+            
+        Returns:
+            bool: 是否过期
+        """
+        return time.time() - self.last_active > ttl
+    
+    def update_activity(self) -> None:
+        """更新最后活动时间"""
+        self.last_active = time.time()
 
 
 class SseServerTransport:
@@ -87,31 +134,33 @@ class SseServerTransport:
             logger.error("connect_sse received non-HTTP request")
             raise ValueError("connect_sse can only handle HTTP requests")
 
-        logger.debug("Setting up SSE connection")
         read_stream: MemoryObjectReceiveStream[types.JSONRPCMessage | Exception]
         read_stream_writer: MemoryObjectSendStream[types.JSONRPCMessage | Exception]
-
-        write_stream: MemoryObjectSendStream[types.JSONRPCMessage]
-        write_stream_reader: MemoryObjectReceiveStream[types.JSONRPCMessage]
-
+        
         read_stream_writer, read_stream = anyio.create_memory_object_stream(0)
         write_stream, write_stream_reader = anyio.create_memory_object_stream(0)
-
+        
         session_id = uuid4()
         session_uri = f"{quote(self._endpoint)}?session_id={session_id.hex}"
-        self._read_stream_writers[session_id] = read_stream_writer
-        logger.debug(f"Created new session with ID: {session_id}")
+        
+        # 存储到 Redis
+        await self._store_stream_writer(session_id, read_stream_writer)
+        logger.debug(f"Successfully stored session {session_id}")
 
+        # 创建 SSE 流
         sse_stream_writer, sse_stream_reader = anyio.create_memory_object_stream(
             0, dict[str, Any]
         )
 
         async def sse_writer():
+            """处理 SSE 事件写入"""
             logger.debug("Starting SSE writer")
             async with sse_stream_writer, write_stream_reader:
+                # 发送 endpoint 事件
                 await sse_stream_writer.send({"event": "endpoint", "data": session_uri})
                 logger.debug(f"Sent endpoint event: {session_uri}")
 
+                # 转发消息
                 async for message in write_stream_reader:
                     logger.debug(f"Sending message via SSE: {message}")
                     await sse_stream_writer.send(
@@ -123,56 +172,108 @@ class SseServerTransport:
                         }
                     )
 
-        async with anyio.create_task_group() as tg:
+        async def event_sender():
+            """发送 SSE 事件到客户端"""
             response = EventSourceResponse(
-                content=sse_stream_reader, data_sender_callable=sse_writer
+                sse_stream_reader,
+                ping=20,  # 发送 ping 事件的间隔（秒）
             )
-            logger.debug("Starting SSE response task")
-            tg.start_soon(response, scope, receive, send)
+            await response(scope, receive, send)
 
-            logger.debug("Yielding read and write streams")
-            yield (read_stream, write_stream)
+        try:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(sse_writer)
+                tg.start_soon(event_sender)
+                yield read_stream, write_stream
+        finally:
+            # 清理资源
+            await self._redis.delete(f"mcp:session:{session_id}")
+            self._read_stream_writers.pop(session_id, None)
+            logger.debug(f"Cleaned up session {session_id}")
 
     async def handle_post_message(
         self, scope: Scope, receive: Receive, send: Send
     ) -> None:
-        logger.debug("Handling POST message")
         request = Request(scope, receive)
-
         session_id_param = request.query_params.get("session_id")
+        
         if session_id_param is None:
-            logger.warning("Received request without session_id")
             response = Response("session_id is required", status_code=400)
             return await response(scope, receive, send)
-
+        
         try:
             session_id = UUID(hex=session_id_param)
-            logger.debug(f"Parsed session ID: {session_id}")
+            writer = await self._get_stream_writer(session_id)
+            
+            if not writer:
+                response = Response("Session not found or expired", status_code=404)
+                return await response(scope, receive, send)
+            
+            # 处理消息...
+            json = await request.json()
+            message = types.JSONRPCMessage.model_validate(json)
+            await writer.send(message)
+            
+            # 刷新 session TTL
+            await self._redis.expire(f"mcp:session:{session_id}", self._session_ttl)
+            
+            response = Response("Accepted", status_code=202)
+            return await response(scope, receive, send)
+            
         except ValueError:
-            logger.warning(f"Received invalid session ID: {session_id_param}")
             response = Response("Invalid session ID", status_code=400)
             return await response(scope, receive, send)
 
-        writer = self._read_stream_writers.get(session_id)
-        if not writer:
-            logger.warning(f"Could not find session for ID: {session_id}")
-            response = Response("Could not find session", status_code=404)
-            return await response(scope, receive, send)
 
-        json = await request.json()
-        logger.debug(f"Received JSON: {json}")
-
+class DistributedSseServerTransport(SseServerTransport):
+    def __init__(self, endpoint: str, redis_client: Redis) -> None:
+        """
+        初始化分布式 SSE 传输层
+        
+        Args:
+            endpoint: SSE 端点
+            redis_client: Redis 客户端实例
+        """
+        super().__init__(endpoint)
+        self._redis = redis_client
+        self._session_ttl = 3600  # 1小时过期
+        
+    async def _store_stream_writer(self, session_id: UUID, writer: MemoryObjectSendStream) -> None:
         try:
-            message = types.JSONRPCMessage.model_validate(json)
-            logger.debug(f"Validated client message: {message}")
-        except ValidationError as err:
-            logger.error(f"Failed to parse message: {err}")
-            response = Response("Could not parse message", status_code=400)
-            await response(scope, receive, send)
-            await writer.send(err)
-            return
-
-        logger.debug(f"Sending message to writer: {message}")
-        response = Response("Accepted", status_code=202)
-        await response(scope, receive, send)
-        await writer.send(message)
+            # 存储可序列化的包装对象
+            serializable_writer = SerializableStreamWriter.from_stream(session_id, writer)
+            await self._redis.setex(
+                f"mcp:session:{session_id}",
+                self._session_ttl,
+                pickle.dumps(serializable_writer)
+            )
+            # 在内存中保持原始的 writer 引用
+            self._read_stream_writers[session_id] = writer
+            logger.debug(f"Successfully stored session {session_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to store session in Redis: {e}")
+            raise
+    
+    async def _get_stream_writer(self, session_id: UUID) -> Optional[MemoryObjectSendStream]:
+        try:
+            data = await self._redis.get(f"mcp:session:{session_id}")
+            if data:
+                serializable_writer = pickle.loads(data)
+                # 更新最后活动时间
+                serializable_writer.update_activity()
+                await self._redis.setex(
+                    f"mcp:session:{session_id}",
+                    self._session_ttl,
+                    pickle.dumps(serializable_writer)
+                )
+                # 返回内存中的原始 writer
+                return self._read_stream_writers[session_id]
+            return None
+        except Exception as e:
+            logger.error(f"Failed to retrieve session from Redis: {e}")
+            return None
+            
+    async def close(self) -> None:
+        """关闭 Redis 连接"""
+        await self._redis.close()
